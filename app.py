@@ -7,6 +7,10 @@ Bulk geo-tag + keyword/title/description tagging for image batches.
 - Pixel data is NEVER touched (metadata-only writes via exiftool) -> no quality/size loss.
 - Optional AI auto-tagging (Google Gemini, free tier) per image, with
   rate-limit throttling + 429 backoff so large batches don't lose rows.
+- AI guidance: give a draft title / seed keywords and AI returns the best
+  title, an expanded top-relevance keyword set (cap configurable up to 120),
+  and a natural human-style description.
+- GPS geo-tagging is fully optional (enter both lat & lng, or leave blank).
 - Reverse geocoding: GPS coordinates -> city/region/country keywords.
 - Supports JPEG, PNG, WebP, TIFF.
 - Full Unicode / Bengali keyword support (IPTC CodedCharacterSet=UTF8).
@@ -64,14 +68,50 @@ GEOCODE_USER_AGENT = "Geo-Tag-Master/1.0 (metadata tagging tool)"
 # model is deprecated; the user can also pick another from the sidebar.
 GEMINI_MODELS = ["gemini-2.0-flash", "gemini-2.5-flash", "gemini-1.5-flash"]
 
-AI_PROMPT = (
-    "You are a professional stock-photography metadata expert. "
-    "Look at this image and respond with ONLY a raw JSON object "
-    "(no markdown, no code fences, no commentary). Schema:\n"
-    '{"title": "<concise descriptive title, max 60 chars>",\n'
-    ' "description": "<one descriptive sentence, max 150 chars>",\n'
-    ' "keywords": ["<10-15 single or two-word SEO keywords>"]}'
-)
+# AI keyword cap. The user can dial this in the sidebar (10..MAX_KEYWORDS_CAP).
+# Note: most stock platforms cap keywords (~25-50). The higher range is meant for
+# your own SEO / owned-site use where a richer keyword set helps.
+DEFAULT_MAX_KEYWORDS = 25
+MAX_KEYWORDS_CAP = 120
+
+
+def build_ai_prompt(seed_title: str = "", seed_keywords: str = "",
+                    max_keywords: int = DEFAULT_MAX_KEYWORDS) -> str:
+    """
+    Build the Gemini prompt. If the user supplies a draft/"demo" title and/or
+    a few seed keywords, the model uses them as *intent/context* and returns an
+    improved best title, an expanded top-relevance keyword set, and a natural,
+    human-sounding description.
+    """
+    seed_title = (seed_title or "").strip()
+    seed_keywords = (seed_keywords or "").strip()
+    max_keywords = max(1, int(max_keywords))
+
+    guidance = ""
+    if seed_title or seed_keywords:
+        parts = ["\nThe user provided this guidance about the subject — treat it "
+                 "as intent/context, keep their topic, but improve on it:"]
+        if seed_title:
+            parts.append(f'- Draft title: "{seed_title}"')
+        if seed_keywords:
+            parts.append(f"- Seed keywords: {seed_keywords}")
+        parts.append("Stay on this topic. Correct anything the image contradicts.")
+        guidance = "\n".join(parts) + "\n"
+
+    return (
+        "You are a professional stock-photography & SEO metadata expert. "
+        "Analyze the image carefully (subject, setting, action, mood, colors, "
+        "and any visible context) together with the user's guidance below."
+        f"{guidance}"
+        "Then respond with ONLY a raw JSON object (no markdown, no code fences, "
+        "no commentary). Schema:\n"
+        '{"title": "<the BEST concise, search-friendly title, max 70 chars>",\n'
+        ' "description": "<a natural, human-written description of 1-2 sentences '
+        '(max 200 chars). Write like a person, not a keyword list. No stuffing.>",\n'
+        f' "keywords": ["<up to {max_keywords} highly relevant, top-ranked SEO '
+        "keywords, ordered most-relevant first; single or two-word terms; mix of "
+        'specific and broad; no duplicates, no hashtags, no numbering>"]}'
+    )
 
 st.set_page_config(page_title="Geo-Tag Master", page_icon="🏷️", layout="wide")
 
@@ -256,9 +296,14 @@ def _is_rate_limit_error(exc: Exception) -> bool:
                                    "quota", "exceeded", "too many requests"))
 
 
-def analyze_image(path: str, model_name: str, api_key: str) -> dict:
+def analyze_image(path: str, model_name: str, api_key: str,
+                  seed_title: str = "", seed_keywords: str = "",
+                  max_keywords: int = DEFAULT_MAX_KEYWORDS) -> dict:
     """
     Return {'title', 'description', 'keywords'} from Gemini.
+
+    Optional seed_title / seed_keywords steer the output toward the user's
+    intended topic; max_keywords caps how many keywords are returned.
 
     Retries with exponential backoff on rate-limit (429) errors so a 50-100
     image batch doesn't lose rows the moment it crosses the per-minute cap.
@@ -271,18 +316,27 @@ def analyze_image(path: str, model_name: str, api_key: str) -> dict:
     img = Image.open(path)
     img.load()  # force read so the file handle can close
 
+    prompt = build_ai_prompt(seed_title, seed_keywords, max_keywords)
+
     last_exc = None
     for attempt in range(RATE_LIMIT_MAX_RETRIES + 1):
         try:
-            resp = model.generate_content([AI_PROMPT, img])
+            resp = model.generate_content([prompt, img])
             raw = (resp.text or "").strip()
             raw = re.sub(r"^```(?:json)?|```$", "", raw, flags=re.MULTILINE).strip()
             data = json.loads(raw)
+            # De-dupe (case-insensitive) and hard-cap the keyword list so the
+            # model can never blow past the user's chosen maximum.
+            seen, kws = set(), []
+            for k in data.get("keywords", []):
+                k = str(k).strip().lstrip("#").strip()
+                if k and k.lower() not in seen:
+                    seen.add(k.lower())
+                    kws.append(k)
             return {
                 "title": str(data.get("title", "")).strip(),
                 "description": str(data.get("description", "")).strip(),
-                "keywords": [str(k).strip() for k in data.get("keywords", [])
-                             if str(k).strip()],
+                "keywords": kws[:max(1, int(max_keywords))],
             }
         except Exception as exc:  # noqa: BLE001
             last_exc = exc
@@ -399,6 +453,7 @@ def main():
         use_ai = st.toggle("Enable AI auto-tagging", value=True)
         api_key = ""
         model_name = GEMINI_MODELS[0]
+        max_keywords = DEFAULT_MAX_KEYWORDS
         if use_ai:
             api_key = st.secrets.get("GEMINI_API_KEY", "") if hasattr(st, "secrets") else ""
             if not api_key:
@@ -408,6 +463,12 @@ def main():
                          "Or set GEMINI_API_KEY in Streamlit secrets.",
                 )
             model_name = st.selectbox("Gemini model", GEMINI_MODELS)
+            max_keywords = st.slider(
+                "Max keywords per image", min_value=10, max_value=MAX_KEYWORDS_CAP,
+                value=DEFAULT_MAX_KEYWORDS,
+                help="How many keywords AI generates per image. Tip: most stock "
+                     "sites cap at ~25-50; go higher only for your own SEO use.",
+            )
             rpm = st.slider(
                 "Max requests / minute", min_value=3, max_value=60,
                 value=DEFAULT_RPM,
@@ -471,26 +532,33 @@ def main():
     with c2:
         copyright_ = st.text_input("Copyright", placeholder="© 2026 Digital Zeon")
     with c3:
-        lat_str = st.text_input("GPS Latitude", placeholder="23.8103")
+        lat_str = st.text_input("GPS Latitude (optional)", placeholder="e.g. 23.8103")
     with c4:
-        lng_str = st.text_input("GPS Longitude", placeholder="90.4125")
+        lng_str = st.text_input("GPS Longitude (optional)", placeholder="e.g. 90.4125")
 
+    # GPS is fully optional. It's only written when BOTH fields hold valid
+    # numbers. A blank or half-filled pair simply skips geo-tagging — it never
+    # blocks the batch.
     lat = lng = None
-    geo_error = False
-    if lat_str.strip() or lng_str.strip():
-        try:
-            lat = float(lat_str)
-            lng = float(lng_str)
-            if not (-90 <= lat <= 90 and -180 <= lng <= 180):
-                raise ValueError
-        except ValueError:
-            geo_error = True
-            st.warning("GPS values must be valid decimals (lat -90..90, lng -180..180). "
-                       "Both fields are required for geo-tagging.")
+    lat_in, lng_in = lat_str.strip(), lng_str.strip()
+    if lat_in or lng_in:
+        if lat_in and lng_in:
+            try:
+                _lat, _lng = float(lat_in), float(lng_in)
+                if -90 <= _lat <= 90 and -180 <= _lng <= 180:
+                    lat, lng = _lat, _lng
+                else:
+                    st.caption("⚠️ GPS out of range (lat −90..90, lng −180..180) — "
+                               "skipping geo-tag.")
+            except ValueError:
+                st.caption("⚠️ GPS values must be decimal numbers — skipping geo-tag.")
+        else:
+            st.caption("ℹ️ Enter *both* latitude and longitude to geo-tag — "
+                       "skipping GPS for now.")
 
     # --- Reverse geocoding: GPS -> location keywords (added to every image) --- #
     geo_keywords = st.session_state.get("geo_keywords", [])
-    if lat is not None and lng is not None and not geo_error:
+    if lat is not None and lng is not None:
         add_loc = st.checkbox(
             "🌍 Add location keywords from GPS (city, region, country)", value=False
         )
@@ -512,7 +580,24 @@ def main():
 
     # ---- Step 3: Per-image metadata + AI ------------------------------- #
     st.subheader("3. Per-image metadata")
+    seed_title = seed_keywords = ""
     if use_ai:
+        with st.expander("🎯 AI guidance (optional) — steer titles, keywords & descriptions"):
+            st.caption(
+                "Give the AI a draft title and/or a few keywords describing your "
+                "batch. It keeps your topic, then writes the best title, an "
+                "expanded top-relevance keyword set, and a natural human-style "
+                "description for each image. Leave blank to let AI work from the "
+                "image alone."
+            )
+            seed_title = st.text_input(
+                "Draft / demo title",
+                placeholder="e.g. Professional tree removal in Houston",
+            )
+            seed_keywords = st.text_input(
+                "Seed keywords (comma-separated)",
+                placeholder="e.g. tree service, Houston, arborist, stump removal",
+            )
         if st.button("🤖 Generate tags with AI", type="secondary"):
             if not api_key:
                 st.error("Enter a Gemini API key in the sidebar first.")
@@ -525,7 +610,12 @@ def main():
                     if idx > 0:
                         time.sleep(delay)   # proactive throttle (backoff handles 429s)
                     try:
-                        out = analyze_image(p, model_name, api_key)
+                        out = analyze_image(
+                            p, model_name, api_key,
+                            seed_title=seed_title,
+                            seed_keywords=seed_keywords,
+                            max_keywords=max_keywords,
+                        )
                         df.at[idx, "title"] = out["title"]
                         df.at[idx, "keywords"] = ", ".join(out["keywords"])
                         df.at[idx, "description"] = out["description"]
@@ -559,7 +649,7 @@ def main():
 
     # ---- Step 4: Process & download ------------------------------------ #
     st.subheader("4. Apply & download")
-    if st.button("💾 Write metadata & build ZIP", type="primary", disabled=geo_error):
+    if st.button("💾 Write metadata & build ZIP", type="primary"):
         df = st.session_state.df
         loc_keywords = st.session_state.get("geo_keywords", [])
         progress = st.progress(0.0, text="Writing metadata…")

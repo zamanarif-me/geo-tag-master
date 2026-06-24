@@ -10,10 +10,12 @@ Upload a ZIP of 50–100 images, tag them (manually or with AI), download the ZI
 ## Features
 
 - 📦 ZIP in → ZIP out (50–100 images per batch)
-- 🗺️ GPS geo-tagging (decimal input → proper EXIF DMS, both hemispheres)
+- 🗺️ GPS geo-tagging — **fully optional** (enter both lat & lng, or leave blank)
 - 🌍 Reverse geocoding — GPS → city / region / country keywords (one OSM lookup per batch)
 - 🏷️ Keywords, Title, Description, Author, Copyright
 - 🤖 Optional AI auto-tagging per image (Google Gemini free tier)
+- 🎯 AI guidance — feed a draft title / seed keywords; AI returns the best title,
+  an expanded top-relevance keyword set (cap **up to 120**), and a human-style description
 - 🚦 Rate-limit safe — proactive RPM throttle + exponential backoff on 429s
 - ✏️ Editable table — review/override every AI suggestion
 - 🌐 Full Unicode / **Bengali** keyword support (IPTC `CodedCharacterSet=UTF8`)
