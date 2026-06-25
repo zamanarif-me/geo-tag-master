@@ -14,8 +14,10 @@ Upload a ZIP of 50–100 images, tag them (manually or with AI), download the ZI
 - 🌍 Reverse geocoding — GPS → city / region / country keywords (one OSM lookup per batch)
 - 🏷️ Keywords, Title, Description, Author, Copyright
 - 🤖 Optional AI auto-tagging per image (Google Gemini free tier)
-- 🎯 AI guidance — feed a draft title / seed keywords; AI returns the best title,
-  an expanded top-relevance keyword set (cap **up to 120**), and a human-style description
+- 🎯 AI guidance — feed a draft title, **Master Keywords**, a **Targeted
+  Country/City**, and a **Demo Keyword Style** to imitate; AI returns the best
+  title, localized SERP-style keyword phrases (cap **up to 120**), and a
+  human-style description
 - 🚦 Rate-limit safe — proactive RPM throttle + exponential backoff on 429s
 - ✏️ Editable table — review/override every AI suggestion
 - 🌐 Full Unicode / **Bengali** keyword support (IPTC `CodedCharacterSet=UTF8`)
@@ -34,7 +36,7 @@ WebP gets XMP + EXIF only (it has no valid IPTC container).
 
 1. Push these files to a GitHub repo.
 2. Go to [share.streamlit.io](https://share.streamlit.io) → **New app** → select the repo, `app.py`.
-3. (Optional) For AI: **Settings → Secrets**, add:
+3. For AI: **Settings → Secrets**, add:
    ```toml
    GEMINI_API_KEY = "your-google-ai-studio-key"
    ```
@@ -42,8 +44,9 @@ WebP gets XMP + EXIF only (it has no valid IPTC container).
 
 `packages.txt` installs `exiftool` automatically. Nothing else to configure.
 
-> Without a secret, you can still paste the key into the sidebar at runtime, or
-> turn AI off and tag manually.
+> The Gemini API key is read **only** from Streamlit secrets — there is no key
+> field in the UI. Without the secret, AI tagging is disabled; you can still
+> tag manually.
 
 ---
 
@@ -92,7 +95,7 @@ Edit the constants at the top of `app.py`:
 | `DEFAULT_RPM` | AI requests/min throttle | 12 |
 | `RATE_LIMIT_MAX_RETRIES` | 429 backoff retries | 4 |
 | `TEMP_MAX_AGE_HOURS` | abandoned-dir sweep age | 2 |
-| `GEMINI_MODELS` | selectable AI models | `gemini-2.0-flash`, … |
+| `GEMINI_MODELS` | selectable AI models (first = default) | `gemini-2.5-flash`, … |
 
 `.streamlit/config.toml` raises the upload limit to 1 GB.
 
@@ -120,7 +123,7 @@ Nominatim's usage policy.
   batches, raise the plan or process in smaller zips.
 - **Stock sites & WebP.** Most stock platforms want JPEG/TIFF, not WebP. WebP
   tagging works fine for web/client delivery.
-- **AI model names change.** If `gemini-2.0-flash` is deprecated, pick another
+- **AI model names change.** If `gemini-2.5-flash` is deprecated, pick another
   from the sidebar dropdown or edit `GEMINI_MODELS`.
 - **Speed.** Metadata is written one image per `exiftool` call. For very large
   batches you can switch to `exiftool -stay_open` batch mode for a big speedup.

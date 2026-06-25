@@ -66,7 +66,8 @@ GEOCODE_USER_AGENT = "Geo-Tag-Master/1.0 (metadata tagging tool)"
 
 # Gemini models that currently expose a free tier. Change the default here if a
 # model is deprecated; the user can also pick another from the sidebar.
-GEMINI_MODELS = ["gemini-2.0-flash", "gemini-2.5-flash", "gemini-1.5-flash"]
+# gemini-2.5-flash is the default (listed first).
+GEMINI_MODELS = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
 
 # AI keyword cap. The user can dial this in the sidebar (10..MAX_KEYWORDS_CAP).
 # Note: most stock platforms cap keywords (~25-50). The higher range is meant for
@@ -75,42 +76,83 @@ DEFAULT_MAX_KEYWORDS = 25
 MAX_KEYWORDS_CAP = 120
 
 
-def build_ai_prompt(seed_title: str = "", seed_keywords: str = "",
+def build_ai_prompt(seed_title: str = "", master_keywords: str = "",
+                    location: str = "", keyword_style: str = "",
                     max_keywords: int = DEFAULT_MAX_KEYWORDS) -> str:
     """
-    Build the Gemini prompt. If the user supplies a draft/"demo" title and/or
-    a few seed keywords, the model uses them as *intent/context* and returns an
-    improved best title, an expanded top-relevance keyword set, and a natural,
-    human-sounding description.
+    Build the Gemini prompt. The user can steer the output with:
+
+    - seed_title      : a draft/"demo" title (intent/context for the topic).
+    - master_keywords : the core services/skills to rank for, e.g.
+                        "Wordpress Developer, Shopify Expert, SEO writer".
+    - location        : a targeted country/city, e.g. "Houston, TX".
+    - keyword_style   : example keyword phrasings the user wants the AI to
+                        imitate, e.g. "Best Local SEO Experts in Houston TX,
+                        Master Local SEO Experts in USA".
+
+    When master_keywords + location + keyword_style are supplied, the model is
+    instructed to behave like an SEO strategist who studied the top-ranking
+    Google SERP for those services in that location, and to produce localized,
+    search-intent keyword phrases that mirror the demo style (e.g.
+    "Best <service> in <city>", "Top <service> near <city>"), blended with the
+    image's own visual context.
     """
     seed_title = (seed_title or "").strip()
-    seed_keywords = (seed_keywords or "").strip()
+    master_keywords = (master_keywords or "").strip()
+    location = (location or "").strip()
+    keyword_style = (keyword_style or "").strip()
     max_keywords = max(1, int(max_keywords))
 
     guidance = ""
-    if seed_title or seed_keywords:
-        parts = ["\nThe user provided this guidance about the subject — treat it "
-                 "as intent/context, keep their topic, but improve on it:"]
+    serp_directive = ""
+    if seed_title or master_keywords or location or keyword_style:
+        parts = ["\nThe user provided this guidance — treat it as intent/context, "
+                 "keep their topic, but improve on it:"]
         if seed_title:
             parts.append(f'- Draft title: "{seed_title}"')
-        if seed_keywords:
-            parts.append(f"- Seed keywords: {seed_keywords}")
+        if master_keywords:
+            parts.append(f"- Master keywords (core services/skills to rank for): {master_keywords}")
+        if location:
+            parts.append(f"- Targeted country/city: {location}")
+        if keyword_style:
+            parts.append(f"- Demo keyword style (imitate this phrasing pattern): {keyword_style}")
         parts.append("Stay on this topic. Correct anything the image contradicts.")
         guidance = "\n".join(parts) + "\n"
+
+        # Only switch into SERP/localized-keyword mode when there is something
+        # concrete to localize or a style to imitate.
+        if master_keywords or location or keyword_style:
+            serp_directive = (
+                "\nKEYWORD STRATEGY: Act as an expert local-SEO strategist who has "
+                "studied the top-ranking Google search results (SERP) for the master "
+                "keywords above"
+                + (f" in {location}" if location else "")
+                + ". Generate high-intent, commercial keyword PHRASES that real "
+                "top-ranking pages target — not single generic words. "
+                + (f"Weave the location ({location}) and its country/region naturally "
+                   "into many phrases (e.g. city, 'near me', state, country variants). "
+                   if location else "")
+                + (f"Closely imitate the user's demo keyword style — produce phrases in "
+                   f"the SAME pattern as: {keyword_style}. "
+                   if keyword_style else "")
+                + "Mix in a few of the exact master keywords and some broader "
+                "variations so the set covers the full search funnel. Keep every "
+                "keyword relevant to what the image actually shows.\n"
+            )
 
     return (
         "You are a professional stock-photography & SEO metadata expert. "
         "Analyze the image carefully (subject, setting, action, mood, colors, "
         "and any visible context) together with the user's guidance below."
-        f"{guidance}"
+        f"{guidance}{serp_directive}"
         "Then respond with ONLY a raw JSON object (no markdown, no code fences, "
         "no commentary). Schema:\n"
         '{"title": "<the BEST concise, search-friendly title, max 70 chars>",\n'
         ' "description": "<a natural, human-written description of 1-2 sentences '
         '(max 200 chars). Write like a person, not a keyword list. No stuffing.>",\n'
         f' "keywords": ["<up to {max_keywords} highly relevant, top-ranked SEO '
-        "keywords, ordered most-relevant first; single or two-word terms; mix of "
-        'specific and broad; no duplicates, no hashtags, no numbering>"]}'
+        "keywords/phrases, ordered most-relevant first; follow the keyword strategy "
+        'above when given; no duplicates, no hashtags, no numbering>"]}'
     )
 
 st.set_page_config(page_title="Geo-Tag Master", page_icon="🏷️", layout="wide")
@@ -297,13 +339,15 @@ def _is_rate_limit_error(exc: Exception) -> bool:
 
 
 def analyze_image(path: str, model_name: str, api_key: str,
-                  seed_title: str = "", seed_keywords: str = "",
+                  seed_title: str = "", master_keywords: str = "",
+                  location: str = "", keyword_style: str = "",
                   max_keywords: int = DEFAULT_MAX_KEYWORDS) -> dict:
     """
     Return {'title', 'description', 'keywords'} from Gemini.
 
-    Optional seed_title / seed_keywords steer the output toward the user's
-    intended topic; max_keywords caps how many keywords are returned.
+    Optional seed_title / master_keywords / location / keyword_style steer the
+    output toward the user's intended topic and localized SEO phrasing;
+    max_keywords caps how many keywords are returned.
 
     Retries with exponential backoff on rate-limit (429) errors so a 50-100
     image batch doesn't lose rows the moment it crosses the per-minute cap.
@@ -316,7 +360,8 @@ def analyze_image(path: str, model_name: str, api_key: str,
     img = Image.open(path)
     img.load()  # force read so the file handle can close
 
-    prompt = build_ai_prompt(seed_title, seed_keywords, max_keywords)
+    prompt = build_ai_prompt(seed_title, master_keywords, location,
+                             keyword_style, max_keywords)
 
     last_exc = None
     for attempt in range(RATE_LIMIT_MAX_RETRIES + 1):
@@ -455,12 +500,18 @@ def main():
         model_name = GEMINI_MODELS[0]
         max_keywords = DEFAULT_MAX_KEYWORDS
         if use_ai:
-            api_key = st.secrets.get("GEMINI_API_KEY", "") if hasattr(st, "secrets") else ""
+            # API key is read ONLY from Streamlit secrets (Settings → Secrets):
+            #   GEMINI_API_KEY = "your-key"
+            # No key input is shown in the UI.
+            try:
+                api_key = st.secrets.get("GEMINI_API_KEY", "")
+            except Exception:  # noqa: BLE001 — secrets file may be absent locally
+                api_key = ""
             if not api_key:
-                api_key = st.text_input(
-                    "Gemini API key", type="password",
-                    help="Get a free key at aistudio.google.com/apikey. "
-                         "Or set GEMINI_API_KEY in Streamlit secrets.",
+                st.warning(
+                    "No Gemini key found. Add `GEMINI_API_KEY` in **Settings → "
+                    "Secrets** (Streamlit Cloud) or in `.streamlit/secrets.toml` "
+                    "locally to enable AI tagging."
                 )
             model_name = st.selectbox("Gemini model", GEMINI_MODELS)
             max_keywords = st.slider(
@@ -580,27 +631,43 @@ def main():
 
     # ---- Step 3: Per-image metadata + AI ------------------------------- #
     st.subheader("3. Per-image metadata")
-    seed_title = seed_keywords = ""
+    seed_title = master_keywords = location = keyword_style = ""
     if use_ai:
         with st.expander("🎯 AI guidance (optional) — steer titles, keywords & descriptions"):
             st.caption(
-                "Give the AI a draft title and/or a few keywords describing your "
-                "batch. It keeps your topic, then writes the best title, an "
-                "expanded top-relevance keyword set, and a natural human-style "
-                "description for each image. Leave blank to let AI work from the "
-                "image alone."
+                "Steer the AI toward localized, SERP-style SEO keywords. Give your "
+                "core services as **Master Keywords**, a **Targeted Country/City**, "
+                "and a **Demo Keyword Style** to imitate. The AI studies the intent "
+                "of top-ranking results and writes the best title, localized keyword "
+                "phrases in your style, and a natural description per image. Leave "
+                "blank to let AI work from the image alone."
             )
             seed_title = st.text_input(
                 "Draft / demo title",
-                placeholder="e.g. Professional tree removal in Houston",
+                placeholder="e.g. Professional WordPress development services",
             )
-            seed_keywords = st.text_input(
-                "Seed keywords (comma-separated)",
-                placeholder="e.g. tree service, Houston, arborist, stump removal",
+            master_keywords = st.text_input(
+                "Master Keywords (comma-separated)",
+                placeholder="e.g. Wordpress Developer, Shopify Expert, Semantic Content Writer",
+                help="Core services/skills you want to rank for. The AI keeps these "
+                     "as the topic and expands them into localized SEO phrases.",
+            )
+            location = st.text_input(
+                "Targeted Country/City",
+                placeholder="e.g. Houston, TX",
+                help="Where you want to rank. The AI weaves this city/state/country "
+                     "into the keyword phrases (e.g. 'in Houston TX', 'near me', 'USA').",
+            )
+            keyword_style = st.text_input(
+                "Demo Keyword Style (comma-separated examples)",
+                placeholder="e.g. Best Local SEO Experts in Houston TX, Master Local SEO Experts in USA",
+                help="Example phrasings to imitate. The AI generates new keywords in "
+                     "this same pattern, localized to your services and city.",
             )
         if st.button("🤖 Generate tags with AI", type="secondary"):
             if not api_key:
-                st.error("Enter a Gemini API key in the sidebar first.")
+                st.error("No Gemini API key configured. Add `GEMINI_API_KEY` to "
+                         "Streamlit secrets (Settings → Secrets) to enable AI tagging.")
             else:
                 df = st.session_state.df
                 delay = 60.0 / max(rpm, 1)   # spacing to respect RPM
@@ -613,7 +680,9 @@ def main():
                         out = analyze_image(
                             p, model_name, api_key,
                             seed_title=seed_title,
-                            seed_keywords=seed_keywords,
+                            master_keywords=master_keywords,
+                            location=location,
+                            keyword_style=keyword_style,
                             max_keywords=max_keywords,
                         )
                         df.at[idx, "title"] = out["title"]
