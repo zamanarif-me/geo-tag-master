@@ -10,6 +10,10 @@ Bulk geo-tag + keyword/title/description tagging for image batches.
 - AI guidance: give a draft title / seed keywords and AI returns the best
   title, an expanded top-relevance keyword set (cap configurable up to 120),
   and a natural human-style description.
+- AI keyword research is current-year aware: titles & tags are generated from
+  modern (e.g. 2026) search trends/terminology automatically.
+- Star rating: writes a configurable XMP + EXIF rating (default 5 ⭐) to every
+  image, visible in Windows Explorer, Lightroom, Bridge, macOS, etc.
 - GPS geo-tagging is fully optional (enter both lat & lng, or leave blank).
 - Reverse geocoding: GPS coordinates -> city/region/country keywords.
 - Supports JPEG, PNG, WebP, TIFF.
@@ -140,11 +144,26 @@ def build_ai_prompt(seed_title: str = "", master_keywords: str = "",
                 "keyword relevant to what the image actually shows.\n"
             )
 
+    # Always-on directive: make the AI research and use CURRENT-year search
+    # behaviour so titles/keywords reflect how people actually search today,
+    # not dated terminology. The year is derived at runtime so this stays
+    # future-proof without code changes.
+    current_year = time.localtime().tm_year
+    modern_directive = (
+        f"\nMODERN KEYWORD RESEARCH ({current_year}): Act as if you have studied "
+        f"the latest {current_year} search trends for this subject. Generate a "
+        "fresh, up-to-date title and keyword set that mirror how real users search "
+        f"RIGHT NOW in {current_year} — current trending terminology, natural-language "
+        "and voice-search phrasing, and 'near me' / high-intent queries where they "
+        "fit. Avoid dated, deprecated, or obsolete tags. The title and keywords must "
+        f"feel modern and relevant for {current_year}.\n"
+    )
+
     return (
         "You are a professional stock-photography & SEO metadata expert. "
         "Analyze the image carefully (subject, setting, action, mood, colors, "
         "and any visible context) together with the user's guidance below."
-        f"{guidance}{serp_directive}"
+        f"{guidance}{serp_directive}{modern_directive}"
         "Then respond with ONLY a raw JSON object (no markdown, no code fences, "
         "no commentary). Schema:\n"
         '{"title": "<the BEST concise, search-friendly title, max 70 chars>",\n'
@@ -214,6 +233,24 @@ def build_exiftool_args(meta: dict, ext: str) -> list[str]:
             args += [f"-XMP-dc:Subject={kw}"]
             if not is_webp:
                 args += [f"-IPTC:Keywords={kw}"]
+
+    # Star rating (0-5). Written to BOTH the XMP and EXIF rating fields so it
+    # shows up everywhere: Windows Explorer & Photos read the EXIF Rating /
+    # RatingPercent (MS) tags, while Lightroom / Bridge / Mac read XMP:Rating.
+    # 0 (or missing) means "don't write a rating" — we leave the field untouched.
+    rating = meta.get("rating")
+    if rating is not None:
+        try:
+            rating = int(rating)
+        except (TypeError, ValueError):
+            rating = 0
+        if 1 <= rating <= 5:
+            rating_percent = {1: 1, 2: 25, 3: 50, 4: 75, 5: 99}[rating]
+            args += [
+                f"-XMP-xmp:Rating={rating}",
+                f"-EXIF:Rating={rating}",
+                f"-EXIF:RatingPercent={rating_percent}",
+            ]
 
     lat, lng = meta.get("lat"), meta.get("lng")
     if lat is not None and lng is not None:
@@ -527,6 +564,16 @@ def main():
                      "rate-limit errors; raise it on a paid key.",
             )
         st.divider()
+        # Star rating written to every image (default 5 ⭐). Shows up in Windows
+        # Explorer, Lightroom, Bridge, macOS, etc. 0 = don't write a rating.
+        star_rating = st.select_slider(
+            "⭐ Star rating (every image)",
+            options=[0, 1, 2, 3, 4, 5],
+            value=5,
+            help="Writes an XMP + EXIF star rating to every image. 5 = ⭐⭐⭐⭐⭐. "
+                 "Set 0 to skip writing a rating.",
+        )
+        st.divider()
         if st.button("🔄 Start over", use_container_width=True):
             reset_session()
             st.rerun()
@@ -740,6 +787,7 @@ def main():
                 "copyright": copyright_,
                 "lat": lat,
                 "lng": lng,
+                "rating": star_rating,
             }
             ok, msg = write_metadata(p, meta)
             report.append({"file": row["file"], "status": "✅" if ok else "❌",
