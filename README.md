@@ -94,7 +94,7 @@ Edit the constants at the top of `app.py`:
 | `MAX_SINGLE_FILE` | per-image ceiling | 200 MB |
 | `DEFAULT_RPM` | AI requests/min throttle | 12 |
 | `RATE_LIMIT_MAX_RETRIES` | 429 backoff retries | 4 |
-| `TEMP_MAX_AGE_HOURS` | abandoned-dir sweep age | 2 |
+| `TEMP_MAX_AGE_HOURS` | abandoned-dir sweep age | 24 |
 | `GEMINI_MODELS` | selectable AI models (first = default) | `gemini-2.5-flash`, … |
 
 `.streamlit/config.toml` raises the upload limit to 1 GB.
@@ -118,15 +118,17 @@ Nominatim's usage policy.
 
 ## Notes & caveats
 
-- **Streamlit Cloud RAM (free tier ≈ 1 GB).** 100 very large images decoded for
-  thumbnails/AI can hit the limit — thumbnails are capped at 18 to help. For huge
-  batches, raise the plan or process in smaller zips.
+- **Streamlit Cloud RAM (free tier ≈ 1 GB).** Zips are streamed to/from disk
+  (never held whole in RAM), thumbnails are capped at 18, and images are
+  downscaled to 1536 px in memory before AI upload. For huge batches, raise
+  the plan or process in smaller zips.
 - **Stock sites & WebP.** Most stock platforms want JPEG/TIFF, not WebP. WebP
   tagging works fine for web/client delivery.
 - **AI model names change.** If `gemini-2.5-flash` is deprecated, pick another
   from the sidebar dropdown or edit `GEMINI_MODELS`.
-- **Speed.** Metadata is written one image per `exiftool` call. For very large
-  batches you can switch to `exiftool -stay_open` batch mode for a big speedup.
+- **Speed.** Metadata writes use a single long-lived `exiftool -stay_open`
+  process for the whole batch — no per-image process startup cost (~10× faster
+  than one call per image).
 
 ---
 

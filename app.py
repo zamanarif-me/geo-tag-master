@@ -23,7 +23,6 @@ Bulk geo-tag + keyword/title/description tagging for image batches.
 Author: Zaman Arif
 """
 
-import io
 import json
 import os
 import re
@@ -52,9 +51,11 @@ MAX_TOTAL_UNCOMPRESSED = 2 * 1024**3  # 2 GB uncompressed -> zip-bomb guard
 MAX_SINGLE_FILE = 200 * 1024**2       # 200 MB per image guard
 
 # Temp-dir handling: every batch lives in a TEMP_PREFIX dir. Abandoned sessions
-# (user closes tab without "Start over") are swept on next app load.
+# (user closes tab without "Start over") are swept on next app load. Active
+# sessions touch their dir's mtime on every rerun so the sweeper never deletes
+# a batch someone is still working on.
 TEMP_PREFIX = "imgmeta_"
-TEMP_MAX_AGE_HOURS = 2
+TEMP_MAX_AGE_HOURS = 24
 
 # Gemini free-tier rate limiting. Flash is ~15 RPM (some models 5 RPM) on the
 # free tier, so we throttle proactively AND back off on 429s. The user can
@@ -70,14 +71,25 @@ GEOCODE_USER_AGENT = "Geo-Tag-Master/1.0 (metadata tagging tool)"
 
 # Gemini models that currently expose a free tier. Change the default here if a
 # model is deprecated; the user can also pick another from the sidebar.
-# gemini-2.5-flash is the default (listed first).
-GEMINI_MODELS = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
+# gemini-2.5-flash is the default (listed first). gemini-1.5-flash was retired
+# by Google in Sept 2025 and must not be listed.
+GEMINI_MODELS = ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash"]
 
 # AI keyword cap. The user can dial this in the sidebar (10..MAX_KEYWORDS_CAP).
 # Note: most stock platforms cap keywords (~25-50). The higher range is meant for
 # your own SEO / owned-site use where a richer keyword set helps.
 DEFAULT_MAX_KEYWORDS = 25
 MAX_KEYWORDS_CAP = 120
+
+# Abort an AI batch after this many consecutive failures (invalid key, dead
+# model, exhausted daily quota) instead of burning retries on every remaining
+# image — a dead 100-image batch used to waste 2+ hours of futile backoff.
+AI_ABORT_CONSECUTIVE = 3
+
+# Images are downscaled to this max dimension (px) before being sent to Gemini.
+# Tagging doesn't need full resolution; this cuts RAM, upload time and tokens.
+# The original file on disk is NEVER touched — only the in-memory AI copy.
+AI_IMAGE_MAX_DIM = 1536
 
 
 def build_ai_prompt(seed_title: str = "", master_keywords: str = "",
@@ -198,11 +210,16 @@ def build_exiftool_args(meta: dict, ext: str) -> list[str]:
     is_webp = ext.lower() == ".webp"
     args: list[str] = []
 
-    title = (meta.get("title") or "").strip()
-    desc = (meta.get("description") or "").strip()
-    author = (meta.get("author") or "").strip()
-    rights = (meta.get("copyright") or "").strip()
-    keywords = [k.strip() for k in meta.get("keywords", []) if k and k.strip()]
+    def _clean(s) -> str:
+        # exiftool -stay_open args are newline-delimited, so flatten any
+        # embedded newlines/whitespace runs in user-supplied values.
+        return " ".join(str(s or "").split())
+
+    title = _clean(meta.get("title"))
+    desc = _clean(meta.get("description"))
+    author = _clean(meta.get("author"))
+    rights = _clean(meta.get("copyright"))
+    keywords = [k for k in (_clean(k) for k in meta.get("keywords", [])) if k]
 
     if title:
         args += [f"-XMP-dc:Title={title}"]
@@ -264,31 +281,61 @@ def build_exiftool_args(meta: dict, ext: str) -> list[str]:
     return args
 
 
-def write_metadata(path: str, meta: dict) -> tuple[bool, str]:
-    """Write metadata in-place, losslessly. Returns (ok, message)."""
-    ext = Path(path).suffix
-    tag_args = build_exiftool_args(meta, ext)
-    if not tag_args:
-        return True, "nothing to write"
+class ExifToolSession:
+    """
+    One long-lived `exiftool -stay_open` process for the whole batch.
 
-    cmd = [
-        "exiftool",
-        "-charset", "iptc=UTF8",          # Bengali / Unicode keywords
-        "-codedcharacterset=UTF8",
-        "-overwrite_original",            # no *_original backup clutter
-        "-m",                             # ignore minor warnings
-        *tag_args,
-        path,
-    ]
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-        if proc.returncode != 0:
-            return False, (proc.stderr or proc.stdout or "exiftool failed").strip()
-        return True, (proc.stdout or "ok").strip()
-    except subprocess.TimeoutExpired:
-        return False, "exiftool timed out"
-    except Exception as exc:  # noqa: BLE001
-        return False, str(exc)
+    Spawning exiftool per image costs ~0.2-0.5 s of Perl startup each; batch
+    mode makes a 100-image write phase roughly 10x faster. Protocol: args are
+    sent one-per-line on stdin, `-execute` runs them, and exiftool prints
+    `{ready}` on stdout when the command finishes. stderr is merged into
+    stdout so error text stays with its command and the pipe can't deadlock.
+    """
+
+    def __init__(self):
+        self.proc = subprocess.Popen(
+            ["exiftool", "-stay_open", "True", "-@", "-"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+
+    def execute(self, args: list[str]) -> tuple[bool, str]:
+        payload = "\n".join([*args, "-execute"]) + "\n"
+        self.proc.stdin.write(payload.encode("utf-8"))
+        self.proc.stdin.flush()
+        lines = []
+        while True:
+            line = self.proc.stdout.readline()
+            if not line:
+                return False, "exiftool exited unexpectedly"
+            text = line.decode("utf-8", "replace").rstrip("\r\n")
+            if text.startswith("{ready}"):
+                break
+            lines.append(text)
+        out = "\n".join(lines).strip()
+        return "1 image files updated" in out, out or "ok"
+
+    def close(self):
+        try:
+            self.proc.stdin.write(b"-stay_open\nFalse\n")
+            self.proc.stdin.flush()
+            self.proc.wait(timeout=10)
+        except Exception:  # noqa: BLE001
+            self.proc.kill()
+
+    def write_metadata(self, path: str, meta: dict) -> tuple[bool, str]:
+        """Write metadata in-place, losslessly. Returns (ok, message)."""
+        tag_args = build_exiftool_args(meta, Path(path).suffix)
+        if not tag_args:
+            return True, "nothing to write"
+        return self.execute([
+            "-charset", "iptc=UTF8",          # Bengali / Unicode keywords
+            "-codedcharacterset=UTF8",
+            "-overwrite_original",            # no *_original backup clutter
+            "-m",                             # ignore minor warnings
+            *tag_args,
+            path,
+        ])
 
 
 # --------------------------------------------------------------------------- #
@@ -300,16 +347,19 @@ def _is_within(directory: str, target: str) -> bool:
     return os.path.commonpath([abs_dir]) == os.path.commonpath([abs_dir, abs_target])
 
 
-def safe_extract(zip_bytes: bytes, dest: str) -> list[str]:
+def safe_extract(zip_file, dest: str) -> tuple[list[str], int]:
     """
-    Extract image files from a zip with protection against:
+    Extract image files from a zip (any seekable file-like object — streamed,
+    never copied wholesale into RAM) with protection against:
       - Zip-slip (path traversal via ../ entries)
-      - Zip-bombs (huge uncompressed size)
+      - Zip-bombs (huge uncompressed size, verified by actual bytes not headers)
       - Too many files
-    Returns the list of extracted image paths.
+    Returns (extracted image paths, count skipped for exceeding MAX_SINGLE_FILE).
+    Raises if the zip yields no usable images at all.
     """
     extracted: list[str] = []
-    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+    skipped_oversized = 0
+    with zipfile.ZipFile(zip_file) as zf:
         infos = [i for i in zf.infolist() if not i.is_dir()]
 
         # zip-bomb guard
@@ -333,6 +383,7 @@ def safe_extract(zip_bytes: bytes, dest: str) -> list[str]:
 
         for info in image_infos:
             if info.file_size > MAX_SINGLE_FILE:
+                skipped_oversized += 1
                 continue  # skip oversized single file
             # Flatten to basename to neutralise any path traversal entirely
             safe_name = os.path.basename(info.filename)
@@ -345,24 +396,48 @@ def safe_extract(zip_bytes: bytes, dest: str) -> list[str]:
                 n += 1
             if not _is_within(dest, out_path):
                 continue  # paranoia guard
+            # Copy with a hard byte limit: zip headers can lie about file_size,
+            # so enforce MAX_SINGLE_FILE on the bytes actually decompressed.
+            copied = 0
             with zf.open(info) as src, open(out_path, "wb") as dst:
-                shutil.copyfileobj(src, dst)
+                while True:
+                    chunk = src.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    copied += len(chunk)
+                    if copied > MAX_SINGLE_FILE:
+                        break
+                    dst.write(chunk)
+            if copied > MAX_SINGLE_FILE:
+                os.remove(out_path)
+                skipped_oversized += 1
+                continue
             extracted.append(out_path)
 
+    if not extracted:
+        raise ValueError(
+            f"All {len(image_infos)} images were skipped — each exceeds the "
+            f"{MAX_SINGLE_FILE // 1024**2} MB per-file limit."
+        )
     extracted.sort(key=lambda p: os.path.basename(p).lower())
-    return extracted
+    return extracted, skipped_oversized
 
 
-def repack(image_dir: str) -> bytes:
-    """Zip up all images in image_dir (stored, no recompression of pixels)."""
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+def repack(image_dir: str) -> str:
+    """
+    Zip all images in image_dir to a file ON DISK (streamed — the result is
+    never held in session RAM) and return its path. ZIP_STORED because
+    JPEG/PNG/WebP are already compressed; deflating again wastes CPU for ~0%.
+    The output lives inside image_dir but is excluded from itself by the
+    extension filter.
+    """
+    out_path = os.path.join(image_dir, "tagged_images.zip")
+    with zipfile.ZipFile(out_path, "w", zipfile.ZIP_STORED) as zf:
         for name in sorted(os.listdir(image_dir)):
             fp = os.path.join(image_dir, name)
             if os.path.isfile(fp) and Path(fp).suffix.lower() in SUPPORTED_EXT:
                 zf.write(fp, arcname=name)
-    buf.seek(0)
-    return buf.read()
+    return out_path
 
 
 # --------------------------------------------------------------------------- #
@@ -370,17 +445,27 @@ def repack(image_dir: str) -> bytes:
 # --------------------------------------------------------------------------- #
 def _is_rate_limit_error(exc: Exception) -> bool:
     """Detect Gemini free-tier 429 / quota-exhausted errors across SDK versions."""
+    code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
+    if code == 429:
+        return True
     text = f"{type(exc).__name__} {exc}".lower()
     return any(s in text for s in ("429", "resourceexhausted", "rate limit",
                                    "quota", "exceeded", "too many requests"))
 
 
-def analyze_image(path: str, model_name: str, api_key: str,
+def make_gemini_client(api_key: str):
+    """Create one google-genai client for the whole batch (not per image)."""
+    from google import genai
+    return genai.Client(api_key=api_key)
+
+
+def analyze_image(path: str, client, model_name: str,
                   seed_title: str = "", master_keywords: str = "",
                   location: str = "", keyword_style: str = "",
                   max_keywords: int = DEFAULT_MAX_KEYWORDS) -> dict:
     """
-    Return {'title', 'description', 'keywords'} from Gemini.
+    Return {'title', 'description', 'keywords'} from Gemini via the google-genai
+    SDK (the old google-generativeai package is deprecated/EOL).
 
     Optional seed_title / master_keywords / location / keyword_style steer the
     output toward the user's intended topic and localized SEO phrasing;
@@ -390,20 +475,30 @@ def analyze_image(path: str, model_name: str, api_key: str,
     image batch doesn't lose rows the moment it crosses the per-minute cap.
     Raises on non-rate-limit failures (caller counts those as row failures).
     """
-    import google.generativeai as genai
+    from google.genai import types
 
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel(model_name)
     img = Image.open(path)
     img.load()  # force read so the file handle can close
+    # Downscale + normalize the IN-MEMORY copy before upload — Gemini doesn't
+    # need full resolution, and CMYK/palette modes can fail serialization.
+    # The file on disk is untouched.
+    if max(img.size) > AI_IMAGE_MAX_DIM:
+        img.thumbnail((AI_IMAGE_MAX_DIM, AI_IMAGE_MAX_DIM))
+    if img.mode not in ("RGB", "L"):
+        img = img.convert("RGB")
 
     prompt = build_ai_prompt(seed_title, master_keywords, location,
                              keyword_style, max_keywords)
+    # JSON mode: the model must return raw JSON, so the fence-stripping below
+    # is only a belt-and-braces fallback.
+    config = types.GenerateContentConfig(response_mime_type="application/json")
 
     last_exc = None
     for attempt in range(RATE_LIMIT_MAX_RETRIES + 1):
         try:
-            resp = model.generate_content([prompt, img])
+            resp = client.models.generate_content(
+                model=model_name, contents=[prompt, img], config=config
+            )
             raw = (resp.text or "").strip()
             raw = re.sub(r"^```(?:json)?|```$", "", raw, flags=re.MULTILINE).strip()
             data = json.loads(raw)
@@ -497,13 +592,23 @@ def sweep_old_temp_dirs(max_age_hours: int = TEMP_MAX_AGE_HOURS) -> int:
     return removed
 
 
-def reset_session():
+def clear_batch_state():
+    """Drop the current batch (files + per-batch session keys)."""
     old = st.session_state.get("work_dir")
     if old and os.path.isdir(old):
         shutil.rmtree(old, ignore_errors=True)
-    for k in ("work_dir", "df", "image_paths", "result_zip", "report",
-              "geo_keywords", "geo_resolved_for"):
+    for k in ("work_dir", "df", "image_paths", "result_zip_path", "report",
+              "geo_keywords", "geo_resolved_for", "batch_sig",
+              "skipped_oversized", "ai_errors"):
         st.session_state.pop(k, None)
+
+
+def reset_session():
+    clear_batch_state()
+    # Bump the uploader's key so Streamlit renders a FRESH file_uploader —
+    # otherwise the old zip stays in the widget and gets re-extracted
+    # immediately on the next rerun.
+    st.session_state.uploader_gen = st.session_state.get("uploader_gen", 0) + 1
 
 
 # --------------------------------------------------------------------------- #
@@ -582,34 +687,57 @@ def main():
 
     # ---- Step 1: Upload ------------------------------------------------- #
     st.subheader("1. Upload image ZIP")
-    upload = st.file_uploader("Drop a .zip of images", type=["zip"], key="uploader")
+    upload = st.file_uploader(
+        "Drop a .zip of images", type=["zip"],
+        key=f"uploader_{st.session_state.get('uploader_gen', 0)}",
+    )
 
-    if upload and "image_paths" not in st.session_state:
-        with st.spinner("Extracting & validating…"):
-            try:
-                work_dir = tempfile.mkdtemp(prefix="imgmeta_")
-                paths = safe_extract(upload.getvalue(), work_dir)
-            except Exception as exc:  # noqa: BLE001
-                st.error(f"❌ {exc}")
-                st.stop()
-            st.session_state.work_dir = work_dir
-            st.session_state.image_paths = paths
-            st.session_state.df = pd.DataFrame(
-                {
-                    "file": [os.path.basename(p) for p in paths],
-                    "title": "",
-                    "keywords": "",       # comma-separated in the editor
-                    "description": "",
-                }
-            )
-        st.rerun()
+    # Extract when a zip arrives OR when a *different* zip replaces the current
+    # one (previously a second upload was silently ignored).
+    if upload is not None:
+        sig = f"{upload.name}:{upload.size}"
+        if st.session_state.get("batch_sig") != sig:
+            clear_batch_state()
+            with st.spinner("Extracting & validating…"):
+                try:
+                    work_dir = tempfile.mkdtemp(prefix=TEMP_PREFIX)
+                    # UploadedFile is file-like: no full-bytes copy into RAM
+                    paths, skipped = safe_extract(upload, work_dir)
+                except Exception as exc:  # noqa: BLE001
+                    st.error(f"❌ {exc}")
+                    st.stop()
+                st.session_state.batch_sig = sig
+                st.session_state.work_dir = work_dir
+                st.session_state.image_paths = paths
+                st.session_state.skipped_oversized = skipped
+                st.session_state.df = pd.DataFrame(
+                    {
+                        "file": [os.path.basename(p) for p in paths],
+                        "title": "",
+                        "keywords": "",       # comma-separated in the editor
+                        "description": "",
+                    }
+                )
+            st.rerun()
 
     if "image_paths" not in st.session_state:
         st.info("Upload a zip to begin.")
         return
 
     paths = st.session_state.image_paths
+
+    # Keep the work dir's mtime fresh so sweep_old_temp_dirs() in OTHER
+    # sessions never deletes a batch this user is still working on.
+    try:
+        os.utime(st.session_state.work_dir, None)
+    except OSError:
+        pass
+
     st.success(f"✅ {len(paths)} images ready.")
+    skipped = st.session_state.get("skipped_oversized", 0)
+    if skipped:
+        st.warning(f"⚠️ {skipped} image(s) skipped — each larger than the "
+                   f"{MAX_SINGLE_FILE // 1024**2} MB per-file limit.")
 
     with st.expander("Preview thumbnails", expanded=False):
         cols = st.columns(6)
@@ -675,6 +803,12 @@ def main():
             geo_keywords = []
             st.session_state.pop("geo_keywords", None)
             st.session_state.pop("geo_resolved_for", None)
+    else:
+        # GPS was cleared or is invalid — drop any previously resolved location
+        # keywords so stale city/country tags are never written to the batch.
+        geo_keywords = []
+        st.session_state.pop("geo_keywords", None)
+        st.session_state.pop("geo_resolved_for", None)
 
     # ---- Step 3: Per-image metadata + AI ------------------------------- #
     st.subheader("3. Per-image metadata")
@@ -716,16 +850,20 @@ def main():
                 st.error("No Gemini API key configured. Add `GEMINI_API_KEY` to "
                          "Streamlit secrets (Settings → Secrets) to enable AI tagging.")
             else:
+                client = make_gemini_client(api_key)
                 df = st.session_state.df
+                st.session_state.pop("ai_errors", None)
                 delay = 60.0 / max(rpm, 1)   # spacing to respect RPM
                 progress = st.progress(0.0, text="Analyzing images…")
-                failures = 0
+                errors: list[dict] = []     # per-row error details, kept for the user
+                consecutive = 0
+                aborted = False
                 for idx, p in enumerate(paths):
                     if idx > 0:
                         time.sleep(delay)   # proactive throttle (backoff handles 429s)
                     try:
                         out = analyze_image(
-                            p, model_name, api_key,
+                            p, client, model_name,
                             seed_title=seed_title,
                             master_keywords=master_keywords,
                             location=location,
@@ -735,17 +873,41 @@ def main():
                         df.at[idx, "title"] = out["title"]
                         df.at[idx, "keywords"] = ", ".join(out["keywords"])
                         df.at[idx, "description"] = out["description"]
-                    except Exception:  # noqa: BLE001
-                        failures += 1
+                        consecutive = 0
+                    except Exception as exc:  # noqa: BLE001
+                        errors.append({
+                            "file": os.path.basename(p),
+                            "error": str(exc)[:300] or type(exc).__name__,
+                        })
+                        consecutive += 1
+                        if consecutive >= AI_ABORT_CONSECUTIVE:
+                            aborted = True
                     progress.progress((idx + 1) / len(paths),
                                       text=f"Analyzing {idx+1}/{len(paths)}…")
+                    if aborted:
+                        break
                 st.session_state.df = df
                 progress.empty()
-                if failures:
-                    st.warning(f"AI finished with {failures} failure(s) — "
-                               "edit those rows manually below.")
+                if errors:
+                    st.session_state.ai_errors = pd.DataFrame(errors)
+                if aborted:
+                    st.error(
+                        f"⛔ AI tagging stopped after {AI_ABORT_CONSECUTIVE} "
+                        f"consecutive failures — likely an invalid API key, a "
+                        f"deprecated model, or an exhausted daily quota. "
+                        f"{len(paths) - idx - 1} image(s) were not attempted. "
+                        "See error details below."
+                    )
+                elif errors:
+                    st.warning(f"AI finished with {len(errors)} failure(s) — "
+                               "see details below and edit those rows manually.")
                 else:
                     st.success("AI tagging complete. Review & edit below.")
+
+        # Persist AI error details across reruns (editing the table reruns the app)
+        if "ai_errors" in st.session_state:
+            with st.expander("⚠️ AI error details"):
+                st.dataframe(st.session_state.ai_errors, use_container_width=True)
 
     st.caption("Edit any cell. Keywords are comma-separated.")
     edited = st.data_editor(
@@ -770,45 +932,52 @@ def main():
         loc_keywords = st.session_state.get("geo_keywords", [])
         progress = st.progress(0.0, text="Writing metadata…")
         report = []
-        for idx, p in enumerate(paths):
-            row = df.iloc[idx]
-            per_image = [k.strip() for k in str(row["keywords"]).split(",") if k.strip()]
-            # merge location keywords without duplicates (case-insensitive)
-            merged, seen = [], set()
-            for k in per_image + loc_keywords:
-                if k.lower() not in seen:
-                    seen.add(k.lower())
-                    merged.append(k)
-            meta = {
-                "title": row["title"],
-                "description": row["description"],
-                "keywords": merged,
-                "author": author,
-                "copyright": copyright_,
-                "lat": lat,
-                "lng": lng,
-                "rating": star_rating,
-            }
-            ok, msg = write_metadata(p, meta)
-            report.append({"file": row["file"], "status": "✅" if ok else "❌",
-                           "detail": "" if ok else msg})
-            progress.progress((idx + 1) / len(paths), text=f"Writing {idx+1}/{len(paths)}…")
+        et = ExifToolSession()   # ONE exiftool process for the whole batch
+        try:
+            for idx, p in enumerate(paths):
+                row = df.iloc[idx]
+                per_image = [k.strip() for k in str(row["keywords"]).split(",") if k.strip()]
+                # merge location keywords without duplicates (case-insensitive)
+                merged, seen = [], set()
+                for k in per_image + loc_keywords:
+                    if k.lower() not in seen:
+                        seen.add(k.lower())
+                        merged.append(k)
+                meta = {
+                    "title": row["title"],
+                    "description": row["description"],
+                    "keywords": merged,
+                    "author": author,
+                    "copyright": copyright_,
+                    "lat": lat,
+                    "lng": lng,
+                    "rating": star_rating,
+                }
+                ok, msg = et.write_metadata(p, meta)
+                report.append({"file": row["file"], "status": "✅" if ok else "❌",
+                               "detail": "" if ok else msg})
+                progress.progress((idx + 1) / len(paths), text=f"Writing {idx+1}/{len(paths)}…")
+        finally:
+            et.close()
         progress.empty()
 
-        st.session_state.result_zip = repack(st.session_state.work_dir)
+        st.session_state.result_zip_path = repack(st.session_state.work_dir)
         st.session_state.report = pd.DataFrame(report)
 
-    if "result_zip" in st.session_state:
+    if "result_zip_path" in st.session_state:
         rep = st.session_state.report
         ok_n = (rep["status"] == "✅").sum()
         st.success(f"Done — {ok_n}/{len(rep)} images tagged successfully.")
-        st.download_button(
-            "⬇️ Download tagged ZIP",
-            data=st.session_state.result_zip,
-            file_name="tagged_images.zip",
-            mime="application/zip",
-            type="primary",
-        )
+        # The zip lives on disk; passing the file handle avoids pinning the
+        # whole archive in session RAM between reruns.
+        with open(st.session_state.result_zip_path, "rb") as f:
+            st.download_button(
+                "⬇️ Download tagged ZIP",
+                data=f,
+                file_name="tagged_images.zip",
+                mime="application/zip",
+                type="primary",
+            )
         if (rep["status"] == "❌").any():
             with st.expander("Show errors"):
                 st.dataframe(rep[rep["status"] == "❌"], use_container_width=True)
